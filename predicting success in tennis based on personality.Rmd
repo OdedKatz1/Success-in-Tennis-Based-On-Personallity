@@ -1,0 +1,253 @@
+---
+title: "predicting tennis based on personality"
+output: html_document
+date: "2024-08-19"
+---
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(readr)
+library(caret) 
+library(rsample)
+library(yardstick)
+library(recipes)
+library(performance)
+library(psych)
+library(parameters)
+library(factoextra)
+```
+
+# loading the data
+```{r}
+players_df <- read_csv("C:/Users/shach/Desktop/פסיכולוגיה/מדעי הנתונים בפסיכולוגיה/עבודה/python/players_df2.csv") |>
+  as.data.frame() |>
+  filter(hand!="U") |> # removing unknown hand because there is too little players with it
+  mutate(sex = as.factor(sex), # turning sex and hand to factors
+         hand = as.factor(hand),
+         top_level = as.factor(ifelse(max_rank <= 8, "yes", "no")), # turning the predicted variable to factor
+         across(where(is.character) & !name, as.numeric), # turning all the other variables to numeric
+         across(where(is.numeric) & !answers_ratio &!contains("LIWC"), round)) |> # rounding the numeric variables
+  select(name, top_level, # selecting the cols by preferred order
+         sex, year, month, hand, height,
+         O5, C5, E5, A5, N5,
+         confi, will, concer, persis, comp,
+         answers_ratio, contains("LIWC")) |>
+  na.omit()
+rownames(players_df) <- players_df$name # setting the rownames to be the names of the players
+players_df <- players_df[-1] # removing the name column
+
+players_df
+```
+# SETUP
+```{r}
+#splitting the data
+set.seed(111)
+
+splits <- initial_split(players_df, prop = 0.75)
+train.data <- training(splits)
+test.data <- testing(splits)
+```
+
+```{r}
+set.seed(112)
+# using the same folds for each model requires converting the rsample object to a caret object
+folds_10 <- vfold_cv(train.data, v = 10)
+folds_10.caret <- rsample2caret(folds_10)
+```
+
+```{r}
+# using the same recipe and trainControl for each model
+# the recipe normalizes the numeric variables and creates one-hot dummy variables for the factors
+rec <- recipe(top_level ~ ., data = train.data) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_dummy(all_factor_predictors(), one_hot = TRUE)
+
+tc <- trainControl(index = folds_10.caret$index, # 10-fold cross-validation
+                    indexOut = folds_10.caret$indexOut,
+  summaryFunction = prSummary ,  # Use F1 as the performance metric
+  classProbs = TRUE,    # Required for calculating F1
+  savePredictions = TRUE,  # Save predictions for each resample
+  #verboseIter = TRUE # Print out-of-sample performance for each fold
+)
+
+```
+
+# LOGISTIC REGRESSION
+## rec
+```{r}
+# tuning the alpha and lambda of the elastic net
+tg <- expand.grid(
+  alpha = seq(0,1,length=50), # [0, 1] uniform distribution
+  lambda = c(0, 2 ^ seq(-7,1, length = 50)) # [0, 2] log distribution
+)
+```
+## train
+```{r}
+# logistic regression with elastic net
+log_model <- train(
+  x = rec, 
+  data = train.data, 
+  method = "glmnet",
+  trControl = tc,
+  tuneGrid = tg,
+  metric = "F"
+)
+```
+## performance
+```{r}
+log_model$bestTune
+
+# the coefficients that are not zero
+coef_df <- coef(log_model$finalModel, s = log_model$bestTune$lambda) |>
+  as.matrix() |>
+  as.data.frame() |>
+  filter(abs(s1)>0) |>
+  arrange(desc(abs(s1)))
+coef_df
+
+# saving the coef names for later use
+log_coef <- as.list(rownames(coef_df))
+log_coef <- log_coef[-1]
+```
+
+
+# KNN   
+## rec
+```{r}
+# tuning the k in KNN
+tg <- expand.grid(
+  k = seq(1,19, by=2) # [1,19] with odd values to avoid ties when voting between the two classes
+)
+```
+## train
+```{r}
+# knn
+knn_model <- train(
+  x = rec, 
+  data = train.data, 
+  method = "knn",
+  tuneGrid = tg,
+  trControl = tc,
+  metric = "F"
+)
+```
+## performance
+```{r}
+plot(knn_model) # performance for each k
+knn_model$bestTune
+```
+# SVM
+## rec
+```{r}
+# tuning the penalty parameter (C) and degree in the polynomial kernel
+tg <- expand.grid(
+  C = 2^seq(-7,4, length=70), # [0.0625, 16] log distribution
+  degree = 1:3, # [1, 3] integer values (1=linear)
+  scale = 1 #doesn't matter for polynomial kernel
+)
+```
+## train
+```{r}
+# svm with polynomial kernel
+svm_model <- train(
+  x = rec, 
+  data = train.data, 
+  method = "svmPoly",
+  tuneGrid = tg,
+  trControl = tc,
+  metric = "F"
+)
+```
+## performance
+```{r}
+svm_model$bestTune
+plot(svm_model)
+svm_model$finalModel
+```
+
+
+# COMPARE MODELS
+```{r}
+# The out-of-sample performance for each fold.
+# Remember we uses the same folds for each model
+color_list <- c("green", "blue", "purple")
+cv_data <- list(
+  knn = knn_model$resample,
+  logisitc = log_model$resample,
+  svm = svm_model$resample
+  ) |> 
+  bind_rows(.id = "Model") |>
+  rename(F1=F)
+  
+# Summary across folds
+# includes f1 mean, sd and coefficient of variation (sd/mean)
+cv_summary <- cv_data |>
+  group_by(Model) |> 
+  summarise(F1_SD = sd(F1) / sqrt(5),
+            F1=mean(F1),
+            coef_var=F1_SD/F1,
+            .groups = "drop") |>
+  select(Model, F1, F1_SD, coef_var)
+cv_summary
+
+# plot
+ggplot(cv_data, aes(Model, F1)) + 
+  geom_line(aes(group = Resample)) + 
+  geom_pointrange(aes(ymin = F1 - F1_SD, ymax = F1 + F1_SD),
+                  data = cv_summary,
+                  color = color_list) +
+  coord_cartesian(ylim = c(0.55, 0.85)) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(color = color_list))
+```
+# correlation between models
+```{r}
+# correlation between the predictions of the models
+pred_df <- data.frame(
+  knn = ifelse(predict(knn_model, newdata = train.data)== "yes", 1, 0),
+  log = ifelse(predict(log_model, newdata = train.data)== "yes", 1, 0),
+  svm = ifelse(predict(svm_model, newdata = train.data)== "yes", 1, 0)
+)
+cor(pred_df)
+```
+
+#TEST
+```{r}
+# test data performance
+test.data$log_pred <- predict(log_model, newdata = test.data)
+confusionMatrix(test.data$log_pred, test.data$top_level)$byClass[["F1"]]
+confusionMatrix(test.data$log_pred, test.data$top_level)
+```
+## fitting regular glm
+```{r}
+# formula to be entered into the glm function
+coef_str <- paste("relevel(top_level, ref = 'no') ~", paste(log_coef, collapse = " + "))
+# setting "yes" to be the positive class
+glm_model <- glm(formula_str, data= test.data, family = "binomial")
+# coefficients summary dataframe
+coef_sum <- summary(log)$coefficients |> as.data.frame() |>
+    mutate(Estimate = round(Estimate, 2),
+         `Pr(>|z|)` = round(`Pr(>|z|)`, 4))
+summary(log)
+```
+## post-hoc investigation
+```{r}
+# performance of all the models on the test data
+models_list <- list(knn_model, log_model, svm_model)
+models_names <- c("knn", "logistic", "svm")
+
+pred <- predict(models_list, newdata = test.data)
+# test performance of all the models on the dataframe
+test_data_performance <- data.frame(
+  Model = models_names,
+  F1 = sapply(pred, function(x) confusionMatrix(x, test.data$top_level)$byClass[["F1"]]),
+  Accuracy = sapply(pred, function(x) confusionMatrix(x, test.data$top_level)$overall[["Accuracy"]]),
+  Sensitivity = sapply(pred, function(x) confusionMatrix(x, test.data$top_level)$byClass[["Sensitivity"]]),
+  Specificity = sapply(pred, function(x) confusionMatrix(x, test.data$top_level)$byClass[["Specificity"]])
+) |>
+  arrange(desc(F1)) |>
+  mutate(across(where(is.numeric), round, 2))
+
+test_data_performance
+```
